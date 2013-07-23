@@ -21,7 +21,6 @@ var muninBanner = regexp.MustCompile(`# munin node at (.*)`)
 type muninCollector struct {
 	name           string
 	hostname       string
-	graphs         []string
 	gaugePerMetric map[string]prometheus.Gauge
 	config         config
 	registry       prometheus.Registry
@@ -65,11 +64,8 @@ func (c *muninCollector) connect() (err error) {
 }
 
 func (c *muninCollector) muninCommand(cmd string) (reader *bufio.Reader, err error) {
-	if c.connection == nil {
-		err := c.connect()
-		if err != nil {
-			return reader, fmt.Errorf("Couldn't connect to munin: %s", err)
-		}
+	if err := c.connect(); err != nil {
+		return reader, fmt.Errorf("Couldn't connect to munin: %s", err)
 	}
 	reader = bufio.NewReader(c.connection)
 
@@ -112,7 +108,7 @@ func (c *muninCollector) muninList() (items []string, err error) {
 	return items, err
 }
 
-func (c *muninCollector) muninConfig(name string) (config map[string]map[string]string, graphConfig map[string]string, err error) {
+func (c *muninCollector) getGraphConfig(name string) (config map[string]map[string]string, graphConfig map[string]string, err error) {
 	graphConfig = make(map[string]string)
 	config = make(map[string]map[string]string)
 
@@ -125,8 +121,9 @@ func (c *muninCollector) muninConfig(name string) (config map[string]map[string]
 		line, err := resp.ReadString('\n')
 		if err == io.EOF {
 			debug(c.Name(), "EOF, retrying")
-			return c.muninConfig(name)
+			return c.getGraphConfig(name)
 		}
+		debug(c.Name(), "config line: %s", line)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -141,53 +138,36 @@ func (c *muninCollector) muninConfig(name string) (config map[string]map[string]
 			return nil, nil, fmt.Errorf("Line unexpected: %s", line)
 		}
 		key, value := parts[0], strings.TrimRight(strings.Join(parts[1:], " "), "\n")
+		debug(c.Name(), "key: %s, val: %s", key, value)
 
 		key_parts := strings.Split(key, ".")
 		if len(key_parts) > 1 { // it's a metric config (metric.label etc)
+			debug(c.Name(), "its a metric config, existing config for %s: %s", key_parts[0], config[key_parts[0]])
 			if _, ok := config[key_parts[0]]; !ok {
 				config[key_parts[0]] = make(map[string]string)
 			}
+			debug(c.Name(), "config[%s][%s] = %s", key_parts[0], key_parts[1], value)
 			config[key_parts[0]][key_parts[1]] = value
 		} else {
+			debug(c.Name(), "graph[%s] = %s", key_parts[0], value)
 			graphConfig[key_parts[0]] = value
 		}
 	}
 	return config, graphConfig, err
 }
 
-
-func (c *muninCollector) registerMetric(name string) (err error) {
-	configs, graphConfig, err := c.muninConfig(name)
-	if err != nil {
-		return fmt.Errorf("Couldn't get config for graph %s: %s", name, err)
-	}
-
-	for metric, config := range configs {
-		metricName := strings.Replace(name+"-"+metric, ".", "_", -1)
-		desc := graphConfig["graph_title"] + ": " + config["label"]
-		if config["info"] != "" {
-			desc = desc + ", " + config["info"]
-		}
-		gauge := prometheus.NewGauge()
-		debug(c.Name(), "Register %s: %s", metricName, desc)
-		c.gaugePerMetric[metricName] = gauge
-		c.registry.Register(metricName, desc, prometheus.NilLabels, gauge)
-	}
-	return nil
+func (c *muninCollector) metricName(graph, metric string) string {
+	return strings.Replace(graph+"-"+metric, ".", "_", -1)
 }
 
-
 func (c *muninCollector) Update() (updates int, err error) {
-	items, err := c.muninList()
+	graphs, err := c.muninList()
 	if err != nil {
 		return updates, fmt.Errorf("Couldn't get graph list: %s", err)
 	}
 
-	for _, name := range items {
-		c.graphs = append(c.graphs, name)
-	}
-
-	for _, graph := range c.graphs {
+	for _, graph := range graphs {
+		debug(c.Name(), "fetching graph %s", graph)
 		munin, err := c.muninCommand("fetch " + graph)
 		if err != nil {
 			return updates, err
@@ -195,6 +175,7 @@ func (c *muninCollector) Update() (updates int, err error) {
 
 		for {
 			line, err := munin.ReadString('\n')
+			debug(c.Name(), "read: %s", line)
 			line = strings.TrimRight(line, "\n")
 			if err == io.EOF {
 				debug(c.Name(), "unexpected EOF, retrying")
@@ -208,29 +189,72 @@ func (c *muninCollector) Update() (updates int, err error) {
 			}
 
 			parts := strings.Fields(line)
-			if len(parts) != 2 {
+			metricParts := strings.Split(parts[0], ".")
+			if len(metricParts) != 2 {
 				debug(c.Name(), "unexpected line: %s", line)
 				continue
 			}
-			key, value_s := strings.Split(parts[0], ".")[0], parts[1]
-			name := graph + "-" + key
-			if _, ok := c.gaugePerMetric[name]; !ok {
-				if err := c.registerMetric(name); err != nil {
-					return updates, err
-				}
+			if metricParts[1] != "value" {
+				continue
 			}
+			metric := metricParts[0]
+
+			value_s := strings.Join(parts[1:], " ")
+
+			gauge, err := c.gaugeFor(graph, metric) // reference to existing or new metrics
+			if err != nil {
+				debug(c.Name(), "%s", err)
+				continue
+			}
+
 			value, err := strconv.ParseFloat(value_s, 64)
 			if err != nil {
 				debug(c.Name(), "Couldn't parse value in line %s, malformed?", line)
 				continue
 			}
+
 			labels := map[string]string{
-				"hostname": c.hostname,
+				"collector": "munin",
+				"hostname":  c.hostname,
 			}
-			debug(c.Name(), "Set %s{%s}: %f\n", name, labels, value)
-			c.gaugePerMetric[name].Set(labels, value)
+			debug(c.Name(), "Set %s/%s{%s}: %f\n", graph, metric, labels, value)
+			gauge.Set(labels, value)
 			updates++
 		}
 	}
 	return updates, err
+}
+
+func (c *muninCollector) gaugeFor(graph, metric string) (prometheus.Gauge, error) {
+	metricName := c.metricName(graph, metric)
+	debug(c.Name(), "Is '%s' already registered?", metricName)
+
+	gauge, ok := c.gaugePerMetric[metricName]
+	if ok {
+		return gauge, nil
+	}
+
+	configs, graphConfig, err := c.getGraphConfig(graph)
+	if err != nil {
+		return nil, fmt.Errorf("Couldn't get config for graph %s: %s", graph, err)
+	}
+	debug(c.Name(), "configs: %s, graphConfig: %s", configs, graphConfig)
+
+	for metric, config := range configs {
+		metricName := c.metricName(graph, metric)
+		desc := graphConfig["graph_title"] + ": " + config["label"]
+		if config["info"] != "" {
+			desc = desc + ", " + config["info"]
+		}
+		gauge := prometheus.NewGauge()
+		debug(c.Name(), "Register %s: %s", metricName, desc)
+		c.gaugePerMetric[metricName] = gauge
+		c.registry.Register(metricName, desc, prometheus.NilLabels, gauge)
+	}
+
+	gauge, ok = c.gaugePerMetric[metricName]
+	if !ok {
+		return nil, fmt.Errorf("metric %s (%s) not found in %s graph", metricName, metric, graph)
+	}
+	return c.gaugePerMetric[metricName], nil
 }

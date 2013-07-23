@@ -87,8 +87,9 @@ func (c *gmondCollector) Update() (updates int, err error) {
 				name := strings.Replace(strings.ToLower(metric.Name), ".", "_", -1)
 
 				var labels = map[string]string{
-					"hostname": host.Name,
-					"cluster":  cluster.Name,
+					"hostname":  host.Name,
+					"cluster":   cluster.Name,
+					"collector": "gmond",
 				}
 				c.setMetric(name, labels, metric)
 				updates++
