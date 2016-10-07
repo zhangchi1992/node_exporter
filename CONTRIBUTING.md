@@ -16,3 +16,16 @@ Prometheus uses GitHub to manage reviews of pull requests.
   and the _Formatting and style_ section of Peter Bourgon's [Go: Best
   Practices for Production
   Environments](http://peter.bourgon.org/go-in-production/#formatting-and-style).
+
+
+## Collector Implementation Guidelines
+
+The Node Exporter is not a general monitoring agent. It sole purpose is to
+expose metrics as provided by the kernel, with the only exception being the
+textfile collector. The metrics should not get transformed in a way that is
+hardware specific and would requires maintaining any form of vendor based
+mappings or conditions.
+
+A Collector may only read `proc` files or use system calls to retrieve metrics.
+Running external commands is not allowed. Use a dedicated exporter instead or
+gather the metrics via the textfile collector.
