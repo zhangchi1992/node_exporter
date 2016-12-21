@@ -20,12 +20,18 @@ Prometheus uses GitHub to manage reviews of pull requests.
 
 ## Collector Implementation Guidelines
 
-The Node Exporter is not a general monitoring agent. It sole purpose is to
+The Node Exporter is not a general monitoring agent. Its sole purpose is to
 expose metrics as provided by the kernel, with the only exception being the
-textfile collector. The metrics should not get transformed in a way that is
-hardware specific and would requires maintaining any form of vendor based
-mappings or conditions.
+textfile collector.
 
-A Collector may only read `proc` files or use system calls to retrieve metrics.
-Running external commands is not allowed. Use a dedicated exporter instead or
-gather the metrics via the textfile collector.
+The metrics should not get transformed in a way that is hardware specific and
+would require maintaining any form of vendor based mappings or conditions. If
+for example a proc file contains the magic number 42 as some identifier, the
+Node Exporter should expose it as it is and not keep a mapping in code to make
+this human readable. Instead, the textfile collector can be used to add a static
+metric which can be joined with the metrics exposed by the exporter to get human
+readable identifier.
+
+A Collector may only read `/proc` or `/sys` files, or use system calls to
+retrieve metrics.  Running external commands is not allowed. Use a dedicated
+exporter instead or gather the metrics via the textfile collector.
