@@ -33,5 +33,6 @@ metric which can be joined with the metrics exposed by the exporter to get human
 readable identifier.
 
 A Collector may only read `/proc` or `/sys` files, or use system calls to
-retrieve metrics.  Running external commands is not allowed. Use a dedicated
-exporter instead or gather the metrics via the textfile collector.
+retrieve metrics. It may not require root privileges. Running external commands
+is not allowed for performance and reliability reasons. Use a dedicated exporter
+instead or gather the metrics via the textfile collector.
