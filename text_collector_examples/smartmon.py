@@ -84,7 +84,7 @@ class Device(collections.namedtuple('DeviceBase', 'path opts')):
 
     @property
     def base_labels(self):
-        return {'disk': self.path}
+        return {'disk': self.path, 'type': self.opts.type}
 
     def smartctl_select(self):
         return ['--device', self.type, self.path]
@@ -115,18 +115,23 @@ def metric_print(metric, prefix=''):
     print(metric_format(metric, prefix))
 
 
-def smart_ctl(*args, check=True):
+def smart_ctl(*args):
     """Wrapper around invoking the smartctl binary.
 
     Returns:
         (str) Data piped to stdout by the smartctl subprocess.
     """
     try:
-        return subprocess.run(
-            ['smartctl', *args], stdout=subprocess.PIPE, check=check
-        ).stdout.decode('utf-8')
+        paras = [item for item in args]
+        # ['ssh', '-l', 'root', '101.100.11.225', 'smartctl']
+        res = subprocess.Popen(
+            ['smartctl'] + paras, stdout=subprocess.PIPE
+        )
+        sout, serr = res.communicate()
+        return sout.decode('utf-8')
     except subprocess.CalledProcessError as e:
         return e.output.decode('utf-8')
+
 
 def smart_ctl_version():
     return smart_ctl('-V').split('\n')[0].split()[1]
@@ -226,10 +231,10 @@ def collect_device_info(device):
         (Metric) metrics describing general device information.
     """
     values = dict(device_info(device))
-    yield Metric('device_info', {
-        **device.base_labels,
+    yield Metric('device_info', dict(
+        device.base_labels,
         **{v: values[k] for k, v in device_info_map.items() if k in values}
-    }, True)
+    ), True)
 
 
 def collect_device_health_self_assessment(device):
@@ -289,8 +294,8 @@ def collect_ata_metrics(device):
         if entry['name'] in smart_attributes_whitelist:
             labels = {
                 'name': entry['name'],
-                **device.base_labels,
             }
+            labels.update(**device.base_labels)
 
             for col in 'value', 'worst', 'threshold':
                 yield Metric(
@@ -308,7 +313,7 @@ def collect_ata_error_count(device):
         (Metric) Device error count.
     """
     error_log = smart_ctl(
-        '-l', 'xerror,1', *device.smartctl_select(), check=False)
+        '-l', 'xerror,1', *device.smartctl_select())
 
     m = ata_error_count_re.search(error_log)
 
@@ -373,6 +378,7 @@ def main():
             previous_name = m.name
 
         metric_print(m, 'smartmon_')
+
 
 if __name__ == '__main__':
     main()
