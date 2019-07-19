@@ -8,6 +8,15 @@ import re
 import shlex
 import subprocess
 
+megacli = '/opt/MegaRAID/MegaCli/MegaCli64'
+
+"""Hardcode a max of 16 HBA and 128 LDs for now. 
+LDTable must be initialized to accept populating list of LD's into each ctlr's list. """
+MaxNumHBA = 16
+MaxNumLD = 128
+LDTable = [[] * MaxNumHBA for i in range(MaxNumLD)]
+NestedLDTable = [[False for i in range(MaxNumLD)] for j in range(MaxNumHBA)]
+
 device_info_re = re.compile(r'^(?P<k>[^:]+?)(?:(?:\sis|):)\s*(?P<v>.*)$')
 
 ata_error_count_re = re.compile(
@@ -90,6 +99,62 @@ class Device(collections.namedtuple('DeviceBase', 'path opts')):
         return ['--device', self.type, self.path]
 
 
+class Hba:
+    def __init__(self, controller_id, output):
+        self.controller_id = controller_id
+        self.output = output
+        self.model = ''
+        self.memory = ''
+        self.temp = ''
+        self.firmware = ''
+        self.bbu = ''
+        self.init_hba_info()
+
+    def init_hba_info(self):
+        for line in self.output:
+            if re.match(r'^Product Name.*$', line.strip()):
+                self.model = line.split(':')[1].strip()
+            elif re.match(r'^Memory Size.*$', line.strip()):
+                self.memory = line.split(':')[1].strip()
+            elif re.match(r'^FW Package Build.*$', line.strip()):
+                self.firmware = line.split(':')[1].strip()
+            elif re.match(r'^ROC temperature :.*$', line.strip()):
+                tmp_str = line.split(':')[1].strip()
+                roc_temp = re.sub(' +.*$', '', tmp_str)
+                if roc_temp != '':
+                    self.temp = str(str(roc_temp) + 'C')
+                else:
+                    self.temp = str('N/A')
+            elif re.match(r'^BBU +:.*$', line.strip()):
+                tmp_str = line.split(':')[1].strip()
+                bbu = re.sub(' +.*$', '', tmp_str)
+                if bbu != '':
+                    self.bbu = str(bbu)
+                else:
+                    self.bbu = str('N/A')
+        if self.bbu == 'Present':
+            cmd = '-AdpBbuCmd -GetBbuStatus -a{controller_id} -NoLog'.format(controller_id=self.controller_id)
+            output = mega_ctl(*shlex.split(cmd, comments=True)).strip().split('\n')
+            for line in output:
+                if re.match(r'^ *Battery Replacement required +:.*$', line.strip()):
+                    tmp_str = line.split(':')[1].strip()
+                    bbu_status = re.sub(' +.*$', '', tmp_str)
+                    if bbu_status == 'Yes':
+                        self.bbu = str('Replace')
+                    else:
+                        self.bbu = str('Good')
+
+    @property
+    def hba_info(self):
+        return {
+            'h/w_model': self.model,
+            'memory_size': self.memory,
+            'temperature': self.temp,
+            'bbu_status': self.bbu,
+            'firmware': self.firmware,
+        }
+
+
 def metric_key(metric, prefix=''):
     return '{prefix}{metric.name}'.format(prefix=prefix, metric=metric)
 
@@ -104,9 +169,16 @@ def metric_format(metric, prefix=''):
         key=key, labels=labels, value=value)
 
 
-def metric_print_meta(metric, prefix=''):
+def metric_print_smart_meta(metric, prefix=''):
     key = metric_key(metric, prefix)
     print('# HELP {key} SMART metric {metric.name}'.format(
+        key=key, metric=metric))
+    print('# TYPE {key} gauge'.format(key=key, metric=metric))
+
+
+def metric_print_megaraid_meta(metric, prefix=''):
+    key = metric_key(metric, prefix)
+    print('# HELP {key} MegaRAID metric {metric.name}'.format(
         key=key, metric=metric))
     print('# TYPE {key} gauge'.format(key=key, metric=metric))
 
@@ -133,8 +205,30 @@ def smart_ctl(*args):
         return e.output.decode('utf-8')
 
 
+def mega_ctl(*args):
+    """Wrapper around invoking the smartctl binary.
+
+    Returns:
+        (str) Data piped to stdout by the smartctl subprocess.
+    """
+    try:
+        paras = [item for item in args]
+        # ['ssh', '-l', 'root', '101.100.11.225', megacli]
+        res = subprocess.Popen(
+            [megacli] + paras, stdout=subprocess.PIPE
+        )
+        sout, serr = res.communicate()
+        return sout.decode('utf-8')
+    except subprocess.CalledProcessError as e:
+        return e.output.decode('utf-8')
+
+
 def smart_ctl_version():
     return smart_ctl('-V').split('\n')[0].split()[1]
+
+
+def megacli_version():
+    return mega_ctl('-V').strip().split('\n')[0].split()[6]
 
 
 def find_devices():
@@ -360,11 +454,162 @@ def collect_disks_smart_metrics():
             yield from collect_ata_error_count(device)
 
 
+def returnControllerNumber(output):
+    for line in output:
+        if re.match(r'^Controller Count.*$', line.strip()):
+            return int(line.split(':')[1].strip().strip('.'))
+
+
+def returnArrayNumber(output):
+    number = 0
+    for line in output:
+        if re.match(r'^(CacheCade )?Virtual Drive:.*$', line.strip()):
+            number += 1
+    return number
+
+
+def get_hba_info(controller_id):
+    cmd = '-AdpAllInfo -a{controller_id} -NoLog'.format(controller_id=controller_id)
+    output = mega_ctl(*shlex.split(cmd, comments=True)).strip().split('\n')
+    hba = Hba(controller_id, output)
+    yield Metric('hba_info', hba.hba_info, True)
+
+
+def get_array_info(controller_id, array_index, output):
+    linenumber = 0
+    target_id = ''
+    raidlvl = ''
+    size = ''
+    state = 'N/A'
+    strpsz = ''
+    dskcache = 'N/A'
+    properties = ''
+    spandepth = 0
+    diskperspan = 0
+
+    for line in output:
+        if re.match(r'^(CacheCade )?Virtual Drive:.*(Target Id: [0-9]+).*$', line.strip()):
+            # Extract the SCSI Target ID
+            target_id = line.strip().split(':')[2].split(')')[0].strip()
+        elif re.match(r'^RAID Level.*?:.*$', line.strip()):
+            # Extract the primary raid type, decide on X0 RAID level later when we hit Span Depth
+            raidlvl = int(line.strip().split(':')[1].split(',')[0].split('-')[1].strip())
+        elif re.match(r'^Size.*?:.*$', line.strip()):
+            # Size reported in MB
+            if re.match(r'^.*MB$', line.strip().split(':')[1]):
+                size = line.strip().split(':')[1].strip('MB').strip()
+                if float(size) > 1000:
+                    size = str(int(round((float(size) / 1000)))) + 'G'
+                else:
+                    size = str(int(round(float(size)))) + 'M'
+            # Size reported in TB
+            elif re.match(r'^.*TB$', line.strip().split(':')[1]):
+                size = line.strip().split(':')[1].strip('TB').strip()
+                size = str(int(round((float(size) * 1000)))) + 'G'
+            # Size reported in GB (default)
+            else:
+                size = line.strip().split(':')[1].strip('GB').strip()
+                size = str(int(round((float(size))))) + 'G'
+        elif re.match(r'^Span Depth.*?:.*$', line.strip()):
+            # If Span Depth is greater than 1 chances are we have a RAID 10, 50 or 60
+            spandepth = line.strip().split(':')[1].strip()
+        elif re.match(r'^State.*?:.*$', line.strip()):
+            state = line.strip().split(':')[1].strip()
+        elif re.match(r'^Strip Size.*?:.*$', line.strip()):
+            strpsz = line.strip().split(':')[1].strip()
+        elif re.match(r'^Number Of Drives per span.*:.*$', line.strip()):
+            diskperspan = int(line.strip().split(':')[1].strip())
+        elif re.match(r'^Current Cache Policy.*?:.*$', line.strip()):
+            props = line.strip().split(':')[1].strip()
+            if re.search('ReadAdaptive', props):
+                properties += 'ADRA'
+            if re.search('ReadAhead', props):
+                properties += 'RA'
+            if re.match('ReadAheadNone', props):
+                properties += 'NORA'
+            if re.search('WriteBack', props):
+                properties += ',WB'
+            if re.match('WriteThrough', props):
+                properties += ',WT'
+        elif re.match(r'^Disk Cache Policy.*?:.*$', line.strip()):
+            props = line.strip().split(':')[1].strip()
+            if re.search('Disabled', props):
+                dskcache = 'Disabled'
+            if re.search('Disk.s Default', props):
+                dskcache = 'Default'
+            if re.search('Enabled', props):
+                dskcache = 'Enabled'
+        linenumber += 1
+
+    # Compute the RAID level
+    NestedLDTable[int(controller_id)][int(array_index)] = False
+    if raidlvl == '':
+        raidtype = str('N/A')
+    else:
+        if int(spandepth) >= 2:
+            raidtype = str('RAID-' + str(raidlvl) + '0')
+            NestedLDTable[controller_id][int(array_index)] = True
+        else:
+            if raidlvl == 1:
+                if diskperspan > 2:
+                    raidtype = str('RAID-10')
+                    NestedLDTable[controller_id][int(array_index)] = True
+                else:
+                    raidtype = str('RAID-' + str(raidlvl))
+            else:
+                raidtype = str('RAID-' + str(raidlvl))
+
+    array_info = {
+        'controller_id': controller_id,
+        'target_id': target_id,
+        'raid_type': raidtype,
+        'memory_size': size,
+        'strip_size': strpsz,
+
+
+    }
+
+    yield Metric('array_info', array_info, True)
+
+
+def collect_disks_megaraid_metrics():
+
+    """Get adapter number"""
+    output = mega_ctl('-adpCount', ' -NoLog').strip().split('\n')
+    controller_number = returnControllerNumber(output)
+
+    for controller_id in range(controller_number):
+        """Get each adapter information """
+        yield from get_hba_info(controller_id)
+
+        """Get Array information """
+        cmd = '-LDInfo -lall -a{controller_id} -NoLog'.format(controller_id=controller_id)
+        output = mega_ctl(*shlex.split(cmd, comments=True)).strip().split('\n')
+        array_number = returnArrayNumber(output)
+
+        ld_id = 0
+        for ld_count in range(array_number):
+            cmd = '-LDInfo -l{ld_id} -a{controller_id} -NoLog'.format(ld_id=ld_id, controller_id=controller_id)
+            output = mega_ctl(*shlex.split(cmd, comments=True)).strip().split('\n')
+            for line in output:
+                if re.match(r'^Adapter.*Virtual Drive .* Does not Exist', line.strip()):
+                    ld_id += 1
+                elif re.match(r'^(CacheCade )?Virtual Drive:', line.strip()):
+                    LDTable[controller_id].append(ld_id)
+                    ld_id += 1
+
+        for array_index in range(array_number):
+            ld_id = LDTable[controller_id][array_index]
+            cmd = '-LDInfo -l{ld_id} -a{controller_id} -NoLog'.format(ld_id=ld_id, controller_id=controller_id)
+            output = mega_ctl(*shlex.split(cmd, comments=True)).strip().split('\n')
+            yield from get_array_info(controller_id, array_index, output)
+
+
 def main():
     version_metric = Metric('smartctl_version', {
         'version': smart_ctl_version()
     }, True)
-    metric_print_meta(version_metric, 'smartmon_')
+    metric_print_smart_meta(version_metric, 'smartmon_')
     metric_print(version_metric, 'smartmon_')
 
     metrics = list(collect_disks_smart_metrics())
@@ -373,11 +618,29 @@ def main():
     previous_name = None
     for m in metrics:
         if m.name != previous_name:
-            metric_print_meta(m, 'smartmon_')
+            metric_print_smart_meta(m, 'smartmon_')
 
             previous_name = m.name
 
         metric_print(m, 'smartmon_')
+
+    version_metric = Metric('megacli_version', {
+        'version': megacli_version()
+    }, True)
+    metric_print_megaraid_meta(version_metric, 'megaraid_')
+    metric_print(version_metric, 'megaraid_')
+
+    metrics = list(collect_disks_megaraid_metrics())
+    metrics.sort(key=lambda i: i.name)
+
+    previous_name = None
+    for m in metrics:
+        if m.name != previous_name:
+            metric_print_megaraid_meta(m, 'megaraid_')
+
+            previous_name = m.name
+
+        metric_print(m, 'megaraid_')
 
 
 if __name__ == '__main__':
